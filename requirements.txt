@@ -1,0 +1,9 @@
+streamlit>=1.40
+anthropic>=0.60
+requests>=2.31
+joblib>=1.4
+numpy>=2.0
+pandas>=2.2
+# Phải KHỚP phiên bản dùng khi huấn luyện model_nba.pkl (pickle của scikit-learn phụ thuộc phiên bản)
+scikit-learn==1.9.1
+tzdata
