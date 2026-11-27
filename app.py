@@ -6,16 +6,22 @@ Luồng: balldontlie.io (lịch thi đấu + kết quả mới) -> model_nba.pkl
 Mới:   du_lieu_nba_lich_su.csv + 10 trận gần nhất (balldontlie) -> Power Rating từng đội
        -> so với kèo chấp (spreads/h2h) từ The Odds API -> gắn cờ NGHỊCH LÝ THỊ TRƯỜNG
        -> Claude phân tích sâu nguyên nhân các trận nghịch lý.
+Mới:   Tab LIVE NFL & NCAAF: ESPN scoreboard (trận status 'in') + kèo live The Odds API -> bắt nghịch lý;
+       Claude chỉ chạy khi bấm nút; tự làm mới bằng streamlit-autorefresh (tùy chọn).
 
 Cần có cạnh file này:  model_nba.pkl  (tạo bằng train_model.py)  và  du_lieu_nba_lich_su.csv
 Cần khai báo trong st.secrets: APP_PASSWORD, BALLDONTLIE_API_KEY, ANTHROPIC_API_KEY, ODDS_API_KEY
 (tùy chọn: CLAUDE_MODEL; ANOMALY_WEB_SEARCH = true để Claude tra tin chấn thương bằng web search)
+Thư viện: xem requirements.txt (có streamlit-autorefresh).
 """
 import copy
+import difflib
 import hmac
 import html
 import json
+import re
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +33,11 @@ import pandas as pd
 import requests
 import streamlit as st
 from anthropic import Anthropic
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:          # thiếu thư viện -> tab Live vẫn chạy, chỉ không tự làm mới được
+    st_autorefresh = None
 
 # ============================================================================
 # LÕI TÍNH ĐẶC TRƯNG (dùng chung cho huấn luyện và ứng dụng web)
@@ -777,6 +788,391 @@ def run_anomaly_analyses(api_key, model, items, cache, use_search=False, on_done
 
 
 # ============================================================================
+# LIVE NFL & NCAAF (ESPN scoreboard + The Odds API live spread/total)
+# ----------------------------------------------------------------------------
+# - ESPN: miễn phí, không cần khóa. Chỉ lấy trận có status.type.state == "in".
+# - The Odds API: chỉ gọi khi CÓ trận đang diễn ra, mỗi giải một lần/chu kỳ, và dùng chung bộ nhớ
+#   đệm giữa các lần tự làm mới -> tiết kiệm hạn mức (mỗi lần gọi = 2 credit: spreads + totals).
+# - Claude: CHỈ chạy khi bấm nút trên từng trận (chạy nền, không chặn giao diện).
+# ============================================================================
+ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football/{slug}/scoreboard"
+LIVE_LEAGUES = {
+    "NFL": {"slug": "nfl", "odds_key": "americanfootball_nfl", "params": {"limit": 100}, "sd_full": 13.5},
+    "NCAAF": {"slug": "college-football", "odds_key": "americanfootball_ncaaf",
+              "params": {"groups": 80, "limit": 400}, "sd_full": 15.0},   # groups=80: FBS
+}
+QUARTER_S = 900                 # mỗi hiệp 15 phút (NFL và NCAAF)
+LIVE_ODDS_MAX_AGE_S = 600       # kèo cập nhật quá 10 phút -> coi là cũ (có thể là kèo trước trận)
+
+# Ngưỡng nghịch lý kèo live
+LIVE_LEAD_MIN = 7               # dẫn >= 7 điểm mà vẫn là cửa dưới -> nghịch lý
+LIVE_MIN_FRAC = 0.03            # bỏ qua phép thử khi còn < 3% thời gian (~1,8 phút)
+LIVE_MIN_DRIFT = 4.0            # kèo ngụ ý hiệu số còn lại tối thiểu 4 điểm mới xét
+LIVE_Z_YELLOW, LIVE_Z_RED = 1.0, 1.6
+PACE_YELLOW_LO, PACE_RED_LO = 0.50, 0.35     # nhịp ghi điểm kèo ngụ ý / nhịp thực tế
+PACE_YELLOW_HI, PACE_RED_HI = 1.40, 1.80
+PACE_MIN_ELAPSED_S = 900        # cần >= 1 hiệp đã đá mới so nhịp
+
+LIVE_SYSTEM_PROMPT = """Bạn là chuyên gia phân tích bóng bầu dục Mỹ (NFL / NCAA Football), viết tiếng Việt tự nhiên, rõ ràng, súc tích.
+
+Bạn nhận một khối JSON là ẢNH CHỤP một trận đang diễn ra: tỷ số, hiệp, đồng hồ, đội cầm bóng, down & distance, vị trí trên sân, \
+tình huống vừa xảy ra, cùng kèo chấp (spread) và Tài/Xỉu (total) trực tiếp đồng thuận từ nhiều nhà cái, và các cờ cảnh báo do hệ thống tính.
+
+QUY TẮC BẮT BUỘC:
+- Chỉ dùng số liệu trong JSON. TUYỆT ĐỐI không bịa chấn thương, tên cầu thủ, thời tiết hay thống kê không có trong JSON.
+- Dữ liệu ESPN và kèo đến từ hai nguồn khác nhau, có thể lệch nhau từ vài chục giây đến vài phút. Khi tỷ số và kèo có vẻ mâu thuẫn, \
+hãy xét khả năng do ĐỘ TRỄ trước khi gọi là bất thường thật.
+- Bạn được dùng kiến thức bóng bầu dục phổ thông (ví dụ 4th & dài thường là punt hoặc field goal, trong red zone khả năng ghi điểm cao, \
+đội cầm bóng thường được cộng khoảng 2–3 điểm trong kèo live) nhưng phải nói rõ đó là nhận định chung, không phải số liệu.
+- Không khuyến khích cá cược, không đưa lời khuyên đặt cược. Đây là phân tích tình huống mang tính tham khảo.
+
+ĐỊNH DẠNG (Markdown, khoảng 200–300 từ, không dùng tiêu đề cấp 1/2):
+**🏈 Cục diện hiện tại:** 2–3 câu về tỷ số, thời gian, đội cầm bóng, down & distance, vị trí sân.
+**📈 Kèo đang nói gì:** 2–3 câu: spread/total live ngụ ý gì về phần còn lại của trận, so với tỷ số và thời gian.
+**🚩 Điểm bất thường & giả thuyết:** 2–3 gạch đầu dòng, mỗi dòng gắn với một con số trong JSON; nếu không có cờ nào thì nói rõ kèo khớp với diễn biến.
+**⚠️ Lưu ý:** 1–2 gạch đầu dòng (độ trễ dữ liệu, giới hạn của phân tích).
+**✅ Kết luận:** 1 câu."""
+
+
+def _num(x, default=None):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ordinal(n):
+    return {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(n, f"{n}th")
+
+
+def parse_iso(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def period_label(p):
+    if 1 <= p <= 4:
+        return f"Q{p}"
+    return "OT" if p == 5 else (f"OT{p - 4}" if p > 5 else "—")
+
+
+# ---------------------------- ESPN ------------------------------------------
+def fetch_espn_events(league):
+    """Lấy sự kiện từ ESPN cho ngày ET hôm qua + hôm nay (trận khuya vắt qua nửa đêm vẫn được thấy)."""
+    cfg = LIVE_LEAGUES[league]
+    url = ESPN_SCOREBOARD.format(slug=cfg["slug"])
+    today = datetime.now(TZ_ET).date()
+    seen, out, ok, last_err = set(), [], 0, None
+    for d in (today - timedelta(days=1), today):
+        try:
+            r = requests.get(url, params={**cfg["params"], "dates": d.strftime("%Y%m%d")},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            ok += 1
+        except Exception as e:
+            last_err = e
+            continue
+        for ev in data.get("events", []) or []:
+            if ev.get("id") not in seen:
+                seen.add(ev.get("id"))
+                out.append(ev)
+    if ok == 0:
+        raise RuntimeError(f"Không gọi được ESPN ({league}): {type(last_err).__name__}: {last_err}")
+    return out, datetime.now(timezone.utc)
+
+
+def norm_live_game(ev, league):
+    """Chuẩn hóa một sự kiện ESPN. Mọi trường đều phòng thủ vì ESPN không có tài liệu chính thức."""
+    comp = (ev.get("competitions") or [{}])[0]
+    stt = ev.get("status") or comp.get("status") or {}
+    typ = stt.get("type") or {}
+    teams = {}
+    for c in comp.get("competitors", []) or []:
+        t = c.get("team") or {}
+        teams[c.get("homeAway")] = {
+            "id": str(t.get("id")), "abbr": t.get("abbreviation") or "?",
+            "name": t.get("displayName") or t.get("name") or "?",
+            "score": int(_num(c.get("score"), 0) or 0),
+        }
+    if "home" not in teams or "away" not in teams:
+        return None
+    sit = comp.get("situation") or {}
+    poss_id = sit.get("possession")
+    poss = next((t["abbr"] for t in teams.values() if poss_id is not None and t["id"] == str(poss_id)), None)
+
+    clock_s = _num(stt.get("clock"))
+    disp = stt.get("displayClock") or ""
+    if clock_s is None and ":" in disp:
+        try:
+            mm, ss = disp.split(":")[:2]
+            clock_s = int(mm) * 60 + float(ss)
+        except ValueError:
+            pass
+
+    dd = sit.get("shortDownDistanceText") or sit.get("downDistanceText")
+    if not dd and sit.get("down") and sit.get("distance") is not None:
+        dd = f"{_ordinal(int(sit['down']))} & {sit['distance']}"
+    odds0 = (comp.get("odds") or [{}])[0] or {}
+    return {
+        "key": f"{league}-{ev.get('id')}", "id": ev.get("id"), "league": league,
+        "state": typ.get("state"), "detail": typ.get("shortDetail") or typ.get("detail") or "",
+        "period": int(_num(stt.get("period"), 0) or 0), "clock_s": clock_s, "clock_txt": disp or "—",
+        "home": teams["home"], "away": teams["away"], "poss": poss,
+        "down_dist": dd, "spot": sit.get("possessionText"), "to_endzone": sit.get("yardsToEndzone"),
+        "red_zone": bool(sit.get("isRedZone")), "last_play": (sit.get("lastPlay") or {}).get("text"),
+        "home_to": sit.get("homeTimeouts"), "away_to": sit.get("awayTimeouts"),
+        "espn_odds": {"details": odds0.get("details"), "ou": odds0.get("overUnder"),
+                      "provider": (odds0.get("provider") or {}).get("name")} if odds0 else None,
+        "start": parse_iso(ev.get("date")),
+    }
+
+
+def live_time_info(g):
+    """(giây còn lại, tỉ lệ thời gian còn lại) hoặc None khi hiệp phụ / thiếu đồng hồ."""
+    p = g["period"]
+    if p < 1 or p > 4 or g["clock_s"] is None:
+        return None
+    rem = (4 - p) * QUARTER_S + min(max(g["clock_s"], 0.0), QUARTER_S)
+    return rem, rem / (4 * QUARTER_S)
+
+
+# ---------------------------- The Odds API (live) ---------------------------
+def fetch_live_odds(api_key, sport_key):
+    r = requests.get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/", params={
+        "apiKey": api_key, "regions": ODDS_REGIONS, "markets": "spreads,totals",
+        "oddsFormat": "decimal", "dateFormat": "iso"}, timeout=30)
+    if r.status_code == 401:
+        raise PermissionError("The Odds API từ chối khóa (HTTP 401). Kiểm tra ODDS_API_KEY.")
+    if r.status_code == 429:
+        raise RuntimeError("The Odds API báo hết hạn mức hoặc gọi quá nhanh (HTTP 429).")
+    r.raise_for_status()
+    return r.json(), {"remaining": r.headers.get("x-requests-remaining"), "last": r.headers.get("x-requests-last")}
+
+
+@st.cache_resource
+def odds_store():
+    return {}
+
+
+def get_live_odds(api_key, league, min_interval_s, force=False):
+    """Gọi The Odds API tối đa 1 lần / `min_interval_s` giây cho mỗi giải (dùng chung mọi lần tự làm mới)."""
+    store, key, now = odds_store(), LIVE_LEAGUES[league]["odds_key"], time.time()
+    ent = store.get(key)
+    wait = max(min_interval_s, 60) if (ent and ent.get("err")) else min_interval_s   # lỗi -> chờ ít nhất 60s mới thử lại
+    if ent and not force and now - ent["t"] < wait:
+        return ent
+    try:
+        events, hdr = fetch_live_odds(api_key, key)
+        ent = {"t": now, "events": events, "remaining": hdr["remaining"], "last": hdr["last"], "err": None}
+    except Exception as e:
+        ent = {"t": now, "events": ent["events"] if ent else [], "remaining": ent.get("remaining") if ent else None,
+               "last": None, "err": f"{type(e).__name__}: {e}"}
+    store[key] = ent
+    return ent
+
+
+def summarize_live_event(ev, now):
+    """Kèo đồng thuận (trung vị) chỉ từ các nhà cái cập nhật gần đây. stale=True nếu không nhà cái nào còn mới."""
+    home_name, away_name = ev.get("home_team"), ev.get("away_team")
+    sp, tt = [], []                       # (giá trị, tuổi giây)
+    for bk in ev.get("bookmakers", []) or []:
+        bk_up = parse_iso(bk.get("last_update"))
+        for mk in bk.get("markets", []) or []:
+            up = parse_iso(mk.get("last_update")) or bk_up
+            age = (now - up).total_seconds() if up else None
+            outs = mk.get("outcomes", []) or []
+            if mk.get("key") == "spreads":
+                pt = next((o.get("point") for o in outs if o.get("name") == home_name), None)
+                if pt is not None:
+                    sp.append((float(pt), age))
+            elif mk.get("key") == "totals":
+                pt = next((o.get("point") for o in outs if str(o.get("name")).lower() == "over"), None)
+                if pt is not None:
+                    tt.append((float(pt), age))
+    if not sp and not tt:
+        return None
+
+    def pick(vals):
+        fresh = [v for v, a in vals if a is None or a <= LIVE_ODDS_MAX_AGE_S]
+        use = fresh if fresh else [v for v, _ in vals]
+        ages = [a for v, a in vals if a is not None]
+        return use, len(fresh), (min(ages) if ages else None)
+
+    su, sf, s_age = pick(sp)
+    tu, tf, t_age = pick(tt)
+    ages = [a for a in (s_age, t_age) if a is not None]
+    return {
+        "home_name": home_name, "away_name": away_name, "commence": parse_iso(ev.get("commence_time")),
+        "spread_home": float(np.median(su)) if su else None,
+        "spread_min": min(su) if su else None, "spread_max": max(su) if su else None, "n_spread": len(su),
+        "total": float(np.median(tu)) if tu else None,
+        "total_min": min(tu) if tu else None, "total_max": max(tu) if tu else None, "n_total": len(tu),
+        "age_s": min(ages) if ages else None,
+        "stale": (bool(sp) and sf == 0) or (bool(tt) and tf == 0) or (not sp and not tt),
+    }
+
+
+def _norm_team(s):
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    s = re.sub(r"\bst\b", "state", s)
+    return " ".join(s.split())
+
+
+def _sim(a, b):
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def match_live_odds(g, summaries):
+    """Ghép trận ESPN với sự kiện The Odds API theo tên đội (mờ) + giờ bắt đầu. Tự đảo dấu spread nếu Odds API đảo nhà/khách."""
+    gh, ga = _norm_team(g["home"]["name"]), _norm_team(g["away"]["name"])
+    best, best_score, swapped = None, 0.0, False
+    for s in summaries:
+        eh, ea = _norm_team(s["home_name"]), _norm_team(s["away_name"])
+        direct, swap = min(_sim(gh, eh), _sim(ga, ea)), min(_sim(gh, ea), _sim(ga, eh))
+        score, sw = (direct, False) if direct >= swap else (swap, True)
+        if score < 0.80:
+            continue
+        if g["start"] and s["commence"] and abs((g["start"] - s["commence"]).total_seconds()) > 8 * 3600:
+            continue
+        if score > best_score:
+            best, best_score, swapped = s, score, sw
+    if best is None:
+        return None
+    out = dict(best)
+    if swapped and out["spread_home"] is not None:
+        out["spread_home"] = -out["spread_home"]
+        out["spread_min"], out["spread_max"] = -best["spread_max"], -best["spread_min"]
+    return out
+
+
+# ---------------------------- Bắt nghịch lý kèo live ------------------------
+def evaluate_live_market(g, mk):
+    """So kèo live với diễn biến thực tế. Trả về dict số liệu + cờ. Không gắn cờ khi kèo cũ hoặc đang hiệp phụ."""
+    hs, as_ = g["home"]["score"], g["away"]["score"]
+    cur_margin, cur_total = hs - as_, hs + as_
+    ti = live_time_info(g)
+    out = {"mk": mk, "cur_margin": cur_margin, "cur_total": cur_total, "ti": ti, "flags": [], "level": None,
+           "mkt_margin": None, "rem_margin": None, "rem_total": None, "z": None, "ratio": None}
+    sh = mk.get("spread_home")
+    if sh is not None:
+        out["mkt_margin"] = -sh                     # hiệu số cuối trận (nhà - khách) mà kèo ngụ ý
+        out["rem_margin"] = out["mkt_margin"] - cur_margin
+    if mk.get("total") is not None:
+        out["rem_total"] = mk["total"] - cur_total
+    if mk["stale"] or ti is None:
+        return out
+    rem_s, frac = ti
+    h, a, flags = g["home"]["abbr"], g["away"]["abbr"], out["flags"]
+
+    if sh is not None:
+        leader, trailing = (h, a) if cur_margin > 0 else (a, h)
+        fav = h if sh < 0 else (a if sh > 0 else None)
+        lead = abs(cur_margin)
+        if lead >= LIVE_LEAD_MIN and fav == trailing and abs(sh) >= 1.0:
+            flags.append({"code": "LEAD_UNDERDOG", "level": "red" if (lead >= 14 or frac <= 0.25) else "yellow", "text": (
+                f"{leader} đang dẫn {lead} điểm ({max(hs, as_)}–{min(hs, as_)}) nhưng thị trường vẫn cho {trailing} là đội chấp "
+                f"{abs(sh):.1f} điểm - kèo live ngược với tỷ số.")})
+        if frac >= LIVE_MIN_FRAC and out["rem_margin"] is not None:
+            sd = LIVE_LEAGUES[g["league"]]["sd_full"] * np.sqrt(frac)
+            z = abs(out["rem_margin"]) / sd
+            out["z"] = float(z)
+            if abs(out["rem_margin"]) >= LIVE_MIN_DRIFT and z >= LIVE_Z_YELLOW:
+                who = h if out["rem_margin"] > 0 else a
+                flags.append({"code": "DRIFT", "level": "red" if z >= LIVE_Z_RED else "yellow", "text": (
+                    f"Kèo live ngụ ý {who} còn thắng thêm {abs(out['rem_margin']):.1f} điểm trong {frac:.0%} thời gian còn lại "
+                    f"(dao động tự nhiên chỉ khoảng ±{sd:.1f} điểm) - lớn hơn diễn biến thông thường. "
+                    f"Quyền cầm bóng thường chỉ giải thích được 2–3 điểm.")})
+
+    if out["rem_total"] is not None:
+        if out["rem_total"] <= 0:
+            flags.append({"code": "TOTAL_PASSED", "level": "red", "text": (
+                f"Tài/Xỉu live ({mk['total']:.1f}) không cao hơn tổng điểm hiện tại ({cur_total}) - "
+                f"kèo có thể chưa cập nhật hoặc đã bị vượt.")})
+        elif frac >= LIVE_MIN_FRAC and (3600 - rem_s) >= PACE_MIN_ELAPSED_S and cur_total >= 10:
+            elapsed_min = (3600 - rem_s) / 60
+            ratio = (out["rem_total"] / (rem_s / 60)) / (cur_total / elapsed_min)
+            out["ratio"] = float(ratio)
+            lvl = None
+            if ratio <= PACE_RED_LO or ratio >= PACE_RED_HI:
+                lvl = "red"
+            elif ratio <= PACE_YELLOW_LO or ratio >= PACE_YELLOW_HI:
+                lvl = "yellow"
+            if lvl:
+                flags.append({"code": "PACE", "level": lvl, "text": (
+                    f"Tài/Xỉu lệch nhịp: trận đang ghi {cur_total / elapsed_min:.2f} điểm/phút, nhưng kèo live ngụ ý phần còn lại chỉ "
+                    f"{out['rem_total'] / (rem_s / 60):.2f} điểm/phút (bằng {ratio:.0%} nhịp hiện tại).")})
+    out["level"] = "red" if any(f["level"] == "red" for f in flags) else ("yellow" if flags else None)
+    return out
+
+
+def live_sort_key(item):
+    g, res = item
+    return ({"red": 0, "yellow": 1}.get(res["level"], 2) if res else 3, g["key"])
+
+
+# ---------------------------- Claude (chạy nền, chỉ khi bấm nút) ------------
+def live_payload(g, res):
+    mk, ti = (res or {}).get("mk"), (res or {}).get("ti")
+    return {
+        "giai": g["league"], "trang_thai": g["detail"],
+        "tran_dau": {"doi_nha": g["home"]["name"], "doi_khach": g["away"]["name"]},
+        "dien_bien": {
+            "ty_so_nha": g["home"]["score"], "ty_so_khach": g["away"]["score"],
+            "hiep": period_label(g["period"]), "dong_ho_con_lai": g["clock_txt"],
+            "ti_le_thoi_gian_con_lai_%": round(ti[1] * 100) if ti else None,
+            "doi_cam_bong": g["poss"], "down_va_distance": g["down_dist"], "vi_tri_tren_san": g["spot"],
+            "yards_toi_end_zone": g["to_endzone"], "trong_red_zone": g["red_zone"],
+            "tinh_huong_vua_xay_ra": g["last_play"],
+            "timeout_con_lai": {"nha": g["home_to"], "khach": g["away_to"]},
+        },
+        "ke_live": None if not mk else {
+            "spread_doi_nha(am=doi_nha_chap)": mk.get("spread_home"),
+            "khoang_spread_giua_cac_nha_cai": [mk.get("spread_min"), mk.get("spread_max")], "so_nha_cai_spread": mk.get("n_spread"),
+            "tai_xiu_live": mk.get("total"), "khoang_tai_xiu": [mk.get("total_min"), mk.get("total_max")],
+            "tuoi_du_lieu_ke_giay": None if mk.get("age_s") is None else round(mk["age_s"]),
+            "ke_co_the_da_cu": bool(mk.get("stale")),
+            "hieu_so_hien_tai_nha_tru_khach": res["cur_margin"],
+            "hieu_so_cuoi_tran_ma_ke_ngu_y": res["mkt_margin"],
+            "hieu_so_con_lai_ma_ke_ngu_y_cho_doi_nha": None if res["rem_margin"] is None else round(res["rem_margin"], 1),
+            "tong_diem_hien_tai": res["cur_total"],
+            "tong_diem_con_lai_ma_ke_ngu_y": None if res["rem_total"] is None else round(res["rem_total"], 1),
+        },
+        "ke_ESPN_tham_khao(co_the_la_ke_truoc_tran)": g["espn_odds"],
+        "co_canh_bao": [f["text"] for f in (res or {}).get("flags", [])],
+    }
+
+
+def generate_live_analysis(client, model, payload):
+    resp = client.messages.create(
+        model=model, max_tokens=1200, system=LIVE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": "Ảnh chụp trận đang diễn ra (JSON):\n"
+                   + json.dumps(payload, ensure_ascii=False, indent=1)}])
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+    if not text:
+        raise RuntimeError("Claude trả về nội dung rỗng.")
+    return text
+
+
+@st.cache_resource
+def ai_executor():
+    return ThreadPoolExecutor(max_workers=2)
+
+
+def _live_ai_worker(job, api_key, model, payload):
+    try:
+        client = Anthropic(api_key=api_key, max_retries=2, timeout=90.0)
+        job["text"] = generate_live_analysis(client, model, payload)
+        job["status"] = "done"
+    except Exception as e:
+        job["err"] = f"{type(e).__name__}: {e}"
+        job["status"] = "error"
+
+
+# ============================================================================
 # GIAO DIỆN STREAMLIT
 # ============================================================================
 CSS = """
@@ -795,6 +1191,13 @@ CSS = """
 .flag-yellow{background:rgba(234,179,8,.18);border-left:8px solid #eab308;color:#ca8a04}
 .mini-flag{display:inline-block;padding:.1rem .55rem;border-radius:999px;font-size:.78rem;font-weight:700;margin-left:.4rem}
 .mini-red{background:rgba(220,38,38,.2);color:#ef4444}.mini-yellow{background:rgba(234,179,8,.25);color:#ca8a04}
+.flag-none{background:rgba(128,128,128,.12);border-left:8px solid #6b7280}
+.sb{display:flex;align-items:center;justify-content:center;gap:1.6rem;margin:.3rem 0 .7rem;flex-wrap:wrap}
+.sb .tm{text-align:center;min-width:110px}.sb .ab{font-weight:700;opacity:.85;font-size:.95rem}
+.sb .sc{font-size:2.7rem;font-weight:800;line-height:1.1}
+.sb .mid{text-align:center}.sb .q{font-weight:800;font-size:1.3rem}.sb .clk{font-size:1.1rem;opacity:.85}
+.live-dot{display:inline-block;width:.6rem;height:.6rem;border-radius:50%;background:#dc2626;margin-right:.35rem;animation:lp 1.4s infinite}
+@keyframes lp{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}
 </style>
 """
 
@@ -838,6 +1241,12 @@ def load_bundle():
 def fetch_odds_cached(api_key):
     """Cache 5 phút để bấm cập nhật nhiều lần không tốn thêm hạn mức The Odds API."""
     return fetch_odds(api_key)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_espn_cached(league):
+    """Cache 20 giây: nhiều lần rerun (bấm nút, tự làm mới) không gọi ESPN dồn dập."""
+    return fetch_espn_events(league)
 
 
 def fmt_tip(dt):
@@ -973,26 +1382,228 @@ def sidebar_info(bundle):
             st.rerun()
 
 
-def main():
-    st.set_page_config(page_title="NBA AI Analyst", page_icon="🏀", layout="wide")
-    st.markdown(CSS, unsafe_allow_html=True)
-    require_password()
+def _pause_live_auto():
+    """Gọi khi bấm cập nhật dự đoán: tắt tự làm mới để không ngắt quá trình cập nhật dài."""
+    if st.session_state.get("live_auto"):
+        st.session_state["live_auto"] = False
+        st.session_state["live_auto_paused"] = True
 
-    st.title("🏀 NBA AI Analyst")
-    st.caption("Mô hình Machine Learning tính xác suất & tổng điểm → Claude viết phân tích tiếng Việt cho từng trận.")
-    try:
-        bundle = load_bundle()
-    except Exception as e:
-        st.error(f"Không tải được mô hình: {e}")
-        st.stop()
-    sidebar_info(bundle)
 
+def render_live_game(g, res, claude_key, model, jobs):
+    mk = res["mk"] if res else None
+    level = res["level"] if res else None
+    h, a = g["home"], g["away"]
+    with st.container(border=True):
+        banner_cls = f"flag flag-{level}" if level else "flag"
+        icon = "🔴" if level == "red" else ("🟡" if level == "yellow" else "")
+        title = "NGHỊCH LÝ KÈO LIVE · " if level else ""
+        st.markdown(
+            f'<div class="{banner_cls}"><span>{icon} {title}{html.escape(a["name"])} @ {html.escape(h["name"])}'
+            f'<span class="badge">{g["league"]}</span></span>'
+            f'<span class="s"><span class="live-dot"></span>LIVE · {html.escape(g["detail"])}</span></div>',
+            unsafe_allow_html=True)
+
+        ball_a = " 🏈" if g["poss"] == a["abbr"] else ""
+        ball_h = " 🏈" if g["poss"] == h["abbr"] else ""
+        st.markdown(
+            f'<div class="sb"><div class="tm"><div class="ab">{html.escape(a["abbr"])}{ball_a}</div><div class="sc">{a["score"]}</div></div>'
+            f'<div class="mid"><div class="q">{period_label(g["period"])}</div><div class="clk">⏱ {html.escape(g["clock_txt"])}</div></div>'
+            f'<div class="tm"><div class="ab">{html.escape(h["abbr"])}{ball_h}</div><div class="sc">{h["score"]}</div></div></div>',
+            unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Hiệp / đồng hồ", f"{period_label(g['period'])} · {g['clock_txt']}")
+        c2.metric("Đội cầm bóng", g["poss"] or "—")
+        if g["red_zone"]:
+            c2.caption("🔴 Red zone")
+        c3.metric("Down & Distance", g["down_dist"] or "—")
+        c4.metric("Vị trí trên sân", g["spot"] or "—")
+        if g["to_endzone"] is not None:
+            c4.caption(f"Còn {g['to_endzone']} yards tới end zone")
+        extra = []
+        if g["last_play"]:
+            extra.append(f"Vừa xảy ra: {g['last_play']}")
+        if g["home_to"] is not None and g["away_to"] is not None:
+            extra.append(f"Timeout còn lại: {a['abbr']} {g['away_to']} · {h['abbr']} {g['home_to']}")
+        if extra:
+            st.caption(" · ".join(extra))
+
+        st.markdown("**📈 Đối chiếu kèo live**")
+        if not mk:
+            st.caption("Chưa ghép được kèo live từ The Odds API cho trận này (nhà cái có thể chưa mở kèo trong trận).")
+        else:
+            m1, m2, m3, m4 = st.columns(4)
+            if mk["spread_home"] is not None:
+                m1.metric(f"Spread live ({h['abbr']})", f"{mk['spread_home']:+.1f}")
+                m1.caption(f"{mk['n_spread']} nhà cái: {mk['spread_min']:+.1f} → {mk['spread_max']:+.1f}")
+            else:
+                m1.metric("Spread live", "—")
+            if mk["total"] is not None:
+                m2.metric("Tài/Xỉu live", f"{mk['total']:.1f}")
+                m2.caption(f"{mk['n_total']} nhà cái: {mk['total_min']:.1f} → {mk['total_max']:.1f}")
+            else:
+                m2.metric("Tài/Xỉu live", "—")
+            m3.metric(f"Hiệu số hiện tại ({h['abbr']})", f"{res['cur_margin']:+d}")
+            if res["rem_margin"] is not None:
+                m3.caption(f"Kèo ngụ ý còn lại: {res['rem_margin']:+.1f}")
+            m4.metric("Tổng điểm hiện tại", f"{res['cur_total']}")
+            if res["rem_total"] is not None:
+                m4.caption(f"Kèo ngụ ý còn lại: {res['rem_total']:+.1f}")
+            age = mk["age_s"]
+            st.caption("Độ mới của kèo: " + ("không rõ" if age is None else f"{age:.0f} giây trước"))
+            if mk["stale"]:
+                st.warning("Kèo từ The Odds API đã cũ (quá 10 phút), có thể là kèo trước trận hoặc nhà cái đã đóng kèo. "
+                           "Không dùng để gắn cờ nghịch lý.")
+            elif res["ti"] is None:
+                st.caption("Đang hiệp phụ hoặc thiếu đồng hồ: không chạy phép thử nghịch lý.")
+            for f in res["flags"]:
+                st.markdown(f"{'🔴' if f['level'] == 'red' else '🟡'} {f['text']}")
+            if not res["flags"] and not mk["stale"] and res["ti"] is not None:
+                st.caption("✅ Kèo live khớp với diễn biến hiện tại.")
+        if g["espn_odds"] and (g["espn_odds"].get("details") or g["espn_odds"].get("ou")):
+            eo = g["espn_odds"]
+            st.caption(f"Tham khảo kèo ESPN: {eo.get('details') or '—'} · O/U {eo.get('ou') or '—'}"
+                       + (f" ({eo['provider']})" if eo.get("provider") else "") + " - có thể là kèo trước trận.")
+
+        # --- Claude: chỉ chạy khi bấm nút ---
+        st.markdown("---")
+        job = jobs.get(g["key"])
+        running = bool(job and job["status"] == "running")
+        label = "🧠 AI Phân tích cục diện Live" if not job else "🔁 AI Phân tích lại cục diện Live"
+        if st.button(label, key=f"live_ai_btn_{g['key']}", disabled=running or not claude_key,
+                     help="Chỉ khi bấm nút này mới gọi Claude API (mỗi lần bấm = 1 lượt gọi, phân tích ảnh chụp tại thời điểm bấm)."):
+            snap = (f"{a['abbr']} {a['score']}–{h['score']} {h['abbr']}, {period_label(g['period'])} {g['clock_txt']}")
+            job = {"status": "running", "text": None, "err": None, "t": datetime.now(TZ_VN), "snap": snap}
+            jobs[g["key"]] = job
+            ai_executor().submit(_live_ai_worker, job, claude_key, model, live_payload(g, res))
+            running = True
+        if not claude_key:
+            st.caption("Thiếu `ANTHROPIC_API_KEY` nên chưa dùng được phân tích AI.")
+        elif not job:
+            st.caption("Claude không tự chạy - chỉ phân tích khi bạn bấm nút.")
+        if job:
+            if job["status"] == "running":
+                st.info("⏳ Claude đang phân tích ảnh chụp trận đấu ...")
+            elif job["status"] == "done":
+                st.caption(f"Phân tích lúc {job['t'].strftime('%H:%M:%S')} (giờ VN), theo ảnh chụp: {job['snap']}. "
+                           "Trận có thể đã thay đổi kể từ đó.")
+                st.markdown(job["text"])
+            else:
+                st.warning(f"Không tạo được phân tích. {job['err']}")
+
+
+def render_live_tab():
+    st.subheader("🔴 LIVE NFL & NCAAF (Real-Time)")
+    if st.session_state.pop("live_auto_paused", False):
+        st.info("Đã tự tắt làm mới tự động khi bạn cập nhật dự đoán (tránh làm gián đoạn quá trình cập nhật). Bật lại nếu cần.")
+
+    c1, c2, c3 = st.columns([1.4, 1.2, 1])
+    auto = c1.toggle("⏱️ Tự động làm mới sân đấu mỗi 60 giây", key="live_auto",
+                     help="Dùng streamlit-autorefresh, miễn phí. Chỉ tải lại ESPN (miễn phí); kèo The Odds API có chu kỳ riêng bên cạnh.")
+    interval = c2.selectbox("Chu kỳ lấy kèo (The Odds API)", [60, 120, 180, 300], index=2, key="live_odds_interval",
+                            format_func=lambda s: f"{s // 60} phút",
+                            help="Mỗi lần gọi tốn 2 credit cho mỗi giải đang có trận live (spreads + totals). Chỉ gọi khi có trận đang diễn ra.")
+    force = c3.button("🔄 Làm mới ngay", help="Tải lại ESPN và ép lấy kèo mới (tốn credit The Odds API).")
+    if force:
+        fetch_espn_cached.clear()
+
+    if auto:
+        if st_autorefresh is None:
+            st.warning("Chưa cài `streamlit-autorefresh` (xem requirements.txt) nên không tự làm mới được.")
+        else:
+            st_autorefresh(interval=60_000, key="live_autorefresh")
+
+    odds_key, claude_key = get_secret("ODDS_API_KEY"), get_secret("ANTHROPIC_API_KEY")
+    model = get_secret("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
+    now = datetime.now(timezone.utc)
+
+    # 1) ESPN: các trận đang diễn ra (state == "in")
+    live_games, counts, fetched = [], {}, []
+    for lg in LIVE_LEAGUES:
+        try:
+            events, ts = fetch_espn_cached(lg)
+        except Exception as e:
+            st.warning(str(e))
+            continue
+        fetched.append(ts)
+        norm = [x for x in (norm_live_game(ev, lg) for ev in events) if x]
+        counts[lg] = {s: sum(1 for x in norm if x["state"] == s) for s in ("in", "pre", "post")}
+        live_games += [x for x in norm if x["state"] == "in"]
+    if fetched:
+        st.caption(f"Dữ liệu ESPN tải lúc {min(fetched).astimezone(TZ_VN).strftime('%H:%M:%S')} (giờ VN). "
+                   "ESPN không phát từng giây: số liệu là ảnh chụp tại thời điểm tải, đồng hồ không chạy giữa hai lần làm mới.")
+    if not live_games:
+        st.info("Hiện không có trận NFL/NCAAF nào đang diễn ra. " +
+                " · ".join(f"{lg}: {c['in']} đang đấu, {c['pre']} sắp diễn ra, {c['post']} đã kết thúc" for lg, c in counts.items()))
+        return
+
+    # 2) Kèo live: chỉ gọi The Odds API cho giải đang có trận live
+    summaries, notes, credits = {}, [], []
+    leagues_live = sorted({g["league"] for g in live_games})
+    if not odds_key:
+        notes.append("Chưa cấu hình `ODDS_API_KEY` trong st.secrets nên chỉ hiển thị diễn biến trận, chưa có kèo live.")
+    else:
+        for lg in leagues_live:
+            ent = get_live_odds(odds_key, lg, interval, force=force)
+            if ent["err"]:
+                notes.append(f"{lg}: không lấy được kèo ({ent['err']}). Sẽ thử lại sau tối thiểu 1 phút.")
+            summaries[lg] = [s for s in (summarize_live_event(e, now) for e in ent["events"]) if s]
+            if ent.get("remaining") is not None:
+                credits.append(f"{lg}: còn {ent['remaining']} credit (lần gọi gần nhất tốn {ent.get('last') or '?'})")
+            st.session_state.setdefault("_odds_t", {})[lg] = ent["t"]
+    for n in notes:
+        st.warning(n)
+    if credits:
+        ages = [f"{lg} {int(time.time() - t)}s trước" for lg, t in st.session_state.get("_odds_t", {}).items() if lg in leagues_live]
+        st.caption("The Odds API - " + " · ".join(credits) + " · kèo lấy lúc: " + ", ".join(ages))
+
+    items = []
+    for g in live_games:
+        mk = match_live_odds(g, summaries.get(g["league"], [])) if summaries.get(g["league"]) else None
+        items.append((g, evaluate_live_market(g, mk) if mk else None))
+    items.sort(key=live_sort_key)
+
+    # 3) Mục cảnh báo nghịch lý + danh sách trận
+    flagged = [(g, r) for g, r in items if r and r["level"]]
+    st.header("🚨 Cảnh báo Kèo Live Nghịch Lý")
+    if flagged:
+        n_red = sum(1 for _, r in flagged if r["level"] == "red")
+        st.caption(f"{len(flagged)} trận bất thường ({n_red} cờ đỏ). Có thể do độ trễ giữa hai nguồn dữ liệu hoặc tin chấn thương "
+                   "mà thị trường biết trước - không phải khuyến nghị đặt cược.")
+        for g, r in flagged:
+            box = st.error if r["level"] == "red" else st.warning
+            box(f"**{g['away']['abbr']} @ {g['home']['abbr']}** ({g['league']}, {period_label(g['period'])} {g['clock_txt']}, "
+                f"{g['away']['score']}–{g['home']['score']}): " + " | ".join(f["text"] for f in r["flags"]))
+    else:
+        st.success("Không có trận live nào có kèo bất thường so với diễn biến hiện tại."
+                   if odds_key else "Cần `ODDS_API_KEY` để đối chiếu kèo live.")
+    st.divider()
+    st.subheader(f"Các trận đang diễn ra ({len(items)})")
+    jobs = st.session_state.setdefault("live_ai", {})
+    for g, r in items:
+        render_live_game(g, r, claude_key, model, jobs)
+
+    # 4) Có phân tích Claude đang chạy nền -> kiểm tra lại mỗi 3 giây (không tốn phí)
+    if any(j["status"] == "running" for j in jobs.values()):
+        if st_autorefresh is not None:
+            st_autorefresh(interval=3000, limit=60, key="live_ai_poll")
+        else:
+            st.caption("Bấm “Làm mới ngay” để xem kết quả phân tích khi Claude xong.")
+
+
+
+
+def render_pregame_tab(bundle, bundle_err):
+    st.caption("Mô hình Machine Learning tính xác suất & tổng điểm → Claude viết phân tích tiếng Việt cho từng trận NBA.")
+    if bundle is None:
+        st.error(f"Không tải được mô hình: {bundle_err}")
+        return
     today_et = datetime.now(TZ_ET).date()
     c1, c2 = st.columns([1, 3])
     target = c1.date_input("Ngày thi đấu (giờ Mỹ – ET)", value=today_et,
                            min_value=today_et, max_value=today_et + timedelta(days=7),
                            help="Lịch NBA/API tính theo giờ miền Đông Mỹ.")
-    go = c2.button("🔄 Cập nhật trận đấu hôm nay", type="primary")
+    go = c2.button("🔄 Cập nhật trận đấu hôm nay", type="primary", on_click=_pause_live_auto)
     c2.caption("Dự đoán dùng dữ liệu các trận đã kết thúc đến hết ngày hôm qua (giờ ET).")
 
     if go:
@@ -1000,7 +1611,7 @@ def main():
         odds_key = get_secret("ODDS_API_KEY")
         if not bdl_key or not claude_key:
             st.error("Thiếu `BALLDONTLIE_API_KEY` hoặc `ANTHROPIC_API_KEY` trong st.secrets.")
-            st.stop()
+            return
         model_name = get_secret("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
         use_search = str(get_secret("ANOMALY_WEB_SEARCH", False)).strip().lower() in ("1", "true", "yes")
         try:
@@ -1131,6 +1742,32 @@ def main():
                        f"Power = {1 - W_FORM:.0%} rating nền (hồi quy ridge, trọng số giảm theo thời gian, hiệu chỉnh đối thủ) "
                        f"+ {W_FORM:.0%} phong độ {FORM_N} trận gần nhất. Nhóm: Mạnh = top 10, Yếu = 10 đội cuối.")
             st.dataframe(ratings_table(r), hide_index=True)
+
+
+def main():
+    st.set_page_config(page_title="Sports AI Analyst", page_icon="🏟️", layout="wide")
+    st.markdown(CSS, unsafe_allow_html=True)
+    require_password()
+
+    st.title("🏟️ Sports AI Analyst")
+    bundle, bundle_err = None, None
+    try:
+        bundle = load_bundle()
+    except Exception as e:           # thiếu model_nba.pkl chỉ ảnh hưởng tab dự đoán, tab Live vẫn chạy
+        bundle_err = str(e)
+    if bundle is not None:
+        sidebar_info(bundle)
+    else:
+        with st.sidebar:
+            if st.button("Đăng xuất"):
+                st.session_state.clear()
+                st.rerun()
+
+    tab_pre, tab_live = st.tabs(["📊 Dự đoán trước trận (NBA)", "🔴 LIVE NFL & NCAAF (Real-Time)"])
+    with tab_pre:
+        render_pregame_tab(bundle, bundle_err)
+    with tab_live:
+        render_live_tab()
 
 if __name__ == "__main__":
     main()
