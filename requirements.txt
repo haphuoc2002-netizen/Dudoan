@@ -1,9 +1,12 @@
-streamlit>=1.40
-anthropic>=0.60
+streamlit>=1.30
+streamlit-autorefresh>=1.0.1
+anthropic>=0.40
 requests>=2.31
-joblib>=1.4
-numpy>=2.0
-pandas>=2.2
-# Phải KHỚP phiên bản dùng khi huấn luyện model_nba.pkl (pickle của scikit-learn phụ thuộc phiên bản)
-scikit-learn==1.9.1
+pandas>=2.0
+numpy>=1.24
+joblib>=1.3
+# model_nba.pkl được huấn luyện bằng scikit-learn: nên ghim ĐÚNG phiên bản dùng khi chạy train_model.py
+# (ví dụ scikit-learn==1.5.2) để tránh cảnh báo/lỗi khi nạp mô hình.
+scikit-learn>=1.3
+# cần cho zoneinfo trên Windows (vô hại trên Linux)
 tzdata
